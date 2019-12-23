@@ -4,6 +4,8 @@ https://arxiv.org/abs/1710.09829
 
 PyTorch implementation by Kenta Iwasaki @ Gram.AI.
 """
+
+
 import sys
 sys.setrecursionlimit(15000)
 
@@ -12,27 +14,36 @@ import torch.nn.functional as F
 from torch import nn
 import numpy as np
 
-BATCH_SIZE = 100
+BATCH_SIZE = 10
 NUM_CLASSES = 10
-NUM_EPOCHS = 500
+NUM_EPOCHS = 5
 NUM_ROUTING_ITERATIONS = 3
 
 
 def softmax(input, dim=1):
+	'''
+
+	'''
+	# 先将dim和最后一个维度交换
     transposed_input = input.transpose(dim, len(input.size()) - 1)
+    # contiguous 是将转置后的数据局转换成连续内存，然后才可以进行view
+    # 然后转换成-1 *channels 的形状
     softmaxed_output = F.softmax(transposed_input.contiguous().view(-1, transposed_input.size(-1)), dim=-1)
     return softmaxed_output.view(*transposed_input.size()).transpose(dim, len(input.size()) - 1)
 
 
 def augmentation(x, max_shift=2):
+	'''
+	数据增强
+	'''    
     _, _, height, width = x.size()
-
+	# 产生切片索引
     h_shift, w_shift = np.random.randint(-max_shift, max_shift + 1, size=2)
     source_height_slice = slice(max(0, h_shift), h_shift + height)
     source_width_slice = slice(max(0, w_shift), w_shift + width)
     target_height_slice = slice(max(0, -h_shift), -h_shift + height)
     target_width_slice = slice(max(0, -w_shift), -w_shift + width)
-
+    # 从原图中扣出来一大部分，然后转移到一个中的一个随机部分
     shifted_image = torch.zeros(*x.size())
     shifted_image[:, :, source_height_slice, source_width_slice] = x[:, :, target_height_slice, target_width_slice]
     return shifted_image.float()
@@ -43,38 +54,57 @@ class CapsuleLayer(nn.Module):
                  num_iterations=NUM_ROUTING_ITERATIONS):
         super(CapsuleLayer, self).__init__()
 
-        self.num_route_nodes = num_route_nodes
-        self.num_iterations = num_iterations
+        self.num_route_nodes = num_route_nodes# [-1,32*6*6]
+        self.num_iterations = num_iterations # 3 超参数
+        self.num_capsules = num_capsules# [8,10]
 
-        self.num_capsules = num_capsules
-
-        if num_route_nodes != -1:
+        
+        # 这个是digit,返回形状num_capsules, num_route_nodes, in_channels, out_channels
+        if num_route_nodes != -1:#[10,32*6*6,8,16]
             self.route_weights = nn.Parameter(torch.randn(num_capsules, num_route_nodes, in_channels, out_channels))
-        else:
+        else:# 这个是primary,第一次有8个胶囊，分出来8个二维卷积函数。# 输入256，输出32通道。
             self.capsules = nn.ModuleList(
                 [nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=0) for _ in
                  range(num_capsules)])
 
     def squash(self, tensor, dim=-1):
+    	'''
+		((||s||)**2/(1+(||s||**2)))*(s/||s||)
+        # 对于primay ,最后一个维度是胶囊个数。
+    	'''
+    	# 对最后一个维度求和，又变成一个胶囊的大小，所以可以对应相除？
         squared_norm = (tensor ** 2).sum(dim=dim, keepdim=True)
         scale = squared_norm / (1 + squared_norm)
         return scale * tensor / torch.sqrt(squared_norm)
 
     def forward(self, x):
-        if self.num_route_nodes != -1:
+        if self.num_route_nodes != -1:# digit
+            # 叉乘。x-->[b,32*6*6,8]
+            # 增加维度，x[1,b,32*6*6,1,8]@[10,1,32*6*6,8,16]，需要关注一下。
+            # 最后两个维度可以做叉乘，其他的维度相同，只在最后两个维度叉乘吗？
+            #uj|i=wij(权重)*Ui(上一层输出)
             priors = x[None, :, :, None, :] @ self.route_weights[:, None, :, :, :]
-
+            # 初始化bij，全0向量
             logits = Variable(torch.zeros(*priors.size())).cuda()
-            for i in range(self.num_iterations):
+            # 权重更新逻辑。
+            for i in range(self.num_iterations):# 
+                # cij=softmax(bij)
                 probs = softmax(logits, dim=2)
+                # 计算输出，第二个维度是啥？
+                # sj=cij*uj|i
+                # vj=squash(sj)
                 outputs = self.squash((probs * priors).sum(dim=2, keepdim=True))
-
+                # 如果不是循环的最后一次，更新logits
                 if i != self.num_iterations - 1:
+                    # 然后按照最后一个维度求和。
                     delta_logits = (priors * outputs).sum(dim=-1, keepdim=True)
                     logits = logits + delta_logits
-        else:
+        else:# primary
+        	# 每一个胶囊都是一个二维卷积，通道256-->32,卷积后改变形状-->[b,c*h*w,1]
             outputs = [capsule(x).view(x.size(0), -1, 1) for capsule in self.capsules]
+            #从最后一个维度连接起来，[b,c*h*w,8]
             outputs = torch.cat(outputs, dim=-1)
+            # 对最后一个维度保持形状压缩，然后除以该值
             outputs = self.squash(outputs)
 
         return outputs
@@ -83,10 +113,12 @@ class CapsuleLayer(nn.Module):
 class CapsuleNet(nn.Module):
     def __init__(self):
         super(CapsuleNet, self).__init__()
-
+        # x-->[b,256,h,w]
         self.conv1 = nn.Conv2d(in_channels=1, out_channels=256, kernel_size=9, stride=1)
+        #[b,c*h*w,8]-->[b,32*6*6,8]
         self.primary_capsules = CapsuleLayer(num_capsules=8, num_route_nodes=-1, in_channels=256, out_channels=32,
                                              kernel_size=9, stride=2)
+        # 
         self.digit_capsules = CapsuleLayer(num_capsules=NUM_CLASSES, num_route_nodes=32 * 6 * 6, in_channels=8,
                                            out_channels=16)
 
@@ -147,7 +179,7 @@ if __name__ == "__main__":
     import torchnet as tnt
 
     model = CapsuleNet()
-    # model.load_state_dict(torch.load('epochs/epoch_327.pt'))
+    model.load_state_dict(torch.load('epochs/epoch_1.pt'))
     model.cuda()
 
     print("# parameters:", sum(param.numel() for param in model.parameters()))
@@ -265,3 +297,4 @@ if __name__ == "__main__":
     engine.hooks['on_end_epoch'] = on_end_epoch
 
     engine.train(processor, get_iterator(True), maxepoch=NUM_EPOCHS, optimizer=optimizer)
+
